@@ -49,6 +49,7 @@ func NewExporter(options ...Option) (*Exporter, error) {
 
 // Test is a test
 func Test() bool {
+	return true
 }
 
 // NewExportPipeline creates a complete export pipeline with the default
