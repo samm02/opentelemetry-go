@@ -47,6 +47,10 @@ func NewExporter(options ...Option) (*Exporter, error) {
 	}, nil
 }
 
+// Test is a test
+func Test() bool {
+}
+
 // NewExportPipeline creates a complete export pipeline with the default
 // selectors, processors, and trace registration. It is the responsibility
 // of the caller to stop the returned push Controller.
