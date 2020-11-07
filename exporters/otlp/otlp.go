@@ -18,10 +18,15 @@ package otlp
 // contrib.go.opencensus.io/exporter/ocagent/connection.go
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io/ioutil"
+	"net"
+	"net/http"
 	"sync"
+	"time"
 	"unsafe"
 
 	"google.golang.org/grpc"
@@ -31,6 +36,7 @@ import (
 	colmetricpb "go.opentelemetry.io/otel/exporters/otlp/internal/opentelemetry-proto-gen/collector/metrics/v1"
 	coltracepb "go.opentelemetry.io/otel/exporters/otlp/internal/opentelemetry-proto-gen/collector/trace/v1"
 
+	//asap "bitbucket.org/atlassian/go-asap"
 	"go.opentelemetry.io/otel/exporters/otlp/internal/transform"
 	metricsdk "go.opentelemetry.io/otel/sdk/export/metric"
 	"go.opentelemetry.io/otel/sdk/export/metric/aggregation"
@@ -61,6 +67,30 @@ type Exporter struct {
 	metadata metadata.MD
 }
 
+type ExporterHTTP struct {
+	// mu protects the non-atomic and non-channel variables
+	mu sync.RWMutex
+	// senderMu protects the concurrent unsafe sends
+	senderMu sync.Mutex
+	started  bool
+
+	client  *ingestionServiceClient
+	headers map[string]string
+	//signer  *asap.client
+
+	startOnce      sync.Once
+	stopCh         chan bool
+	disconnectedCh chan bool
+
+	backgroundConnectionDoneCh chan bool
+}
+
+type ingestionServiceClient struct {
+	client  *http.Client
+	headers map[string]string
+	//signer  asap.Client
+}
+
 var _ tracesdk.SpanExporter = (*Exporter)(nil)
 var _ metricsdk.Exporter = (*Exporter)(nil)
 
@@ -80,6 +110,15 @@ func newConfig(opts ...ExporterOption) config {
 // NewExporter constructs a new Exporter and starts it.
 func NewExporter(opts ...ExporterOption) (*Exporter, error) {
 	exp := NewUnstartedExporter(opts...)
+	if err := exp.Start(); err != nil {
+		return nil, err
+	}
+	return exp, nil
+}
+
+// NewExporter constructs a new Exporter and starts it.
+func NewExporterHTTP() (*ExporterHTTP, error) {
+	exp := new(ExporterHTTP)
 	if err := exp.Start(); err != nil {
 		return nil, err
 	}
@@ -136,6 +175,38 @@ func (e *Exporter) Start() error {
 	})
 
 	return err
+}
+
+func (e *ExporterHTTP) Start() error {
+	//var err = errAlreadyStarted
+	e.startOnce.Do(func() {
+
+		e.mu.Lock()
+		e.started = true
+		e.disconnectedCh = make(chan bool, 1)
+		e.stopCh = make(chan bool)
+		e.backgroundConnectionDoneCh = make(chan bool)
+		e.mu.Unlock()
+
+		e.client = &ingestionServiceClient{
+			client: &http.Client{
+				Timeout: time.Second * 10,
+				Transport: &http.Transport{
+					Dial: (&net.Dialer{
+						Timeout: 5 * time.Second,
+					}).Dial,
+					TLSHandshakeTimeout: 5 * time.Second,
+				},
+			},
+			headers: map[string]string{
+				"service":      "anvil",
+				"environment":  "local",
+				"Content-Type": "application/x-protobuf",
+			},
+		}
+	})
+
+	return nil
 }
 
 func (e *Exporter) prepareCollectorAddress() string {
@@ -285,9 +356,90 @@ func (e *Exporter) Export(parent context.Context, cps metricsdk.CheckpointSet) e
 	return nil
 }
 
+// Export implements the "go.opentelemetry.io/otel/sdk/export/metric".Exporter
+// interface. It transforms and batches metric Records into OTLP Metrics and
+// transmits them to the configured collector.
+func (e *ExporterHTTP) Export(parent context.Context, cps metricsdk.CheckpointSet) error {
+	// Unify the parent context Done signal with the exporter stopCh.
+	ctx, cancel := context.WithCancel(parent)
+	defer cancel()
+	go func(ctx context.Context, cancel context.CancelFunc) {
+		select {
+		case <-ctx.Done():
+		case <-e.stopCh:
+			cancel()
+		}
+	}(ctx, cancel)
+
+	var workers uint = 1
+
+	rms, err := transform.CheckpointSet(ctx, e, cps, workers)
+	if err != nil {
+		return err
+	}
+
+	select {
+	case <-e.stopCh:
+		return errStopped
+	case <-ctx.Done():
+		return errContextCanceled
+	default:
+		e.senderMu.Lock()
+
+		msr := &colmetricpb.ExportMetricsServiceRequest{
+			ResourceMetrics: rms,
+		}
+
+		msrbytes, err := msr.Marshal()
+		if err != nil {
+			fmt.Errorf("error marshalling request: %w", err)
+			return err
+		}
+
+		//ctxmtd := e.contextWithMetadata(ctx)
+		//send those pieces of data as proto-bytes
+		//_, err := e.metricExporter.Export(ctxmtd, msr)
+
+		req, err := http.NewRequest(http.MethodPost, "https://obsvs-ingestion.ap-southeast-2.dev.atl-paas.net/v1/metrics", bytes.NewReader(msrbytes))
+		if err != nil {
+			fmt.Errorf("error creating request: %w", err)
+			return err
+		}
+
+		for k, v := range e.client.headers {
+			req.Header.Set(k, v)
+		}
+
+		resp, err := e.client.client.Do(req)
+		if err != nil {
+			fmt.Errorf("failed to send metrics to ingestion %w", err)
+			return err
+		}
+
+		fmt.Printf("obsvs-ingestion/metrics response: %v\n", resp.Status)
+		if resp.StatusCode == http.StatusOK {
+			bodyBytes, err := ioutil.ReadAll(resp.Body)
+			if err != nil {
+				return err
+			}
+			bodyString := string(bodyBytes)
+			fmt.Printf("obsvs-ingestion/metrics response: %v\n", bodyString)
+		}
+
+		e.senderMu.Unlock()
+	}
+	return nil
+}
+
 // ExportKindFor reports back to the OpenTelemetry SDK sending this Exporter
 // metric telemetry that it needs to be provided in a pass-through format.
 func (e *Exporter) ExportKindFor(*otel.Descriptor, aggregation.Kind) metricsdk.ExportKind {
+	return metricsdk.PassThroughExporter
+}
+
+// ExportKindFor reports back to the OpenTelemetry SDK sending this Exporter
+// metric telemetry that it needs to be provided in a pass-through format.
+func (e *ExporterHTTP) ExportKindFor(*otel.Descriptor, aggregation.Kind) metricsdk.ExportKind {
 	return metricsdk.PassThroughExporter
 }
 

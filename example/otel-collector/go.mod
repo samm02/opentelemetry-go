@@ -9,6 +9,7 @@ replace (
 )
 
 require (
+	bitbucket.org/observability/obsvs-sidecar v0.0.5 // indirect
 	go.opentelemetry.io/otel v0.13.0
 	go.opentelemetry.io/otel/exporters/otlp v0.13.0
 	go.opentelemetry.io/otel/sdk v0.13.0
