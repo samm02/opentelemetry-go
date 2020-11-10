@@ -22,9 +22,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 	"unsafe"
@@ -361,6 +361,7 @@ func (e *Exporter) Export(parent context.Context, cps metricsdk.CheckpointSet) e
 // transmits them to the configured collector.
 func (e *ExporterHTTP) Export(parent context.Context, cps metricsdk.CheckpointSet) error {
 	// Unify the parent context Done signal with the exporter stopCh.
+
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 	go func(ctx context.Context, cancel context.CancelFunc) {
@@ -389,7 +390,8 @@ func (e *ExporterHTTP) Export(parent context.Context, cps metricsdk.CheckpointSe
 		msr := &colmetricpb.ExportMetricsServiceRequest{
 			ResourceMetrics: rms,
 		}
-
+		fmt.Printf(strconv.Itoa(msr.Size()))
+		fmt.Printf(msr.String())
 		msrbytes, err := msr.Marshal()
 		if err != nil {
 			fmt.Errorf("error marshalling request: %w", err)
@@ -401,6 +403,7 @@ func (e *ExporterHTTP) Export(parent context.Context, cps metricsdk.CheckpointSe
 		//_, err := e.metricExporter.Export(ctxmtd, msr)
 
 		req, err := http.NewRequest(http.MethodPost, "https://obsvs-ingestion.ap-southeast-2.dev.atl-paas.net/v1/metrics", bytes.NewReader(msrbytes))
+		//req, err := http.NewRequest(http.MethodPost, "https://obsvs-ingestion.us-east-1.staging.atl-paas.net/v1/metrics", bytes.NewReader(msrbytes))
 		if err != nil {
 			fmt.Errorf("error creating request: %w", err)
 			return err
@@ -417,14 +420,6 @@ func (e *ExporterHTTP) Export(parent context.Context, cps metricsdk.CheckpointSe
 		}
 
 		fmt.Printf("obsvs-ingestion/metrics response: %v\n", resp.Status)
-		if resp.StatusCode == http.StatusOK {
-			bodyBytes, err := ioutil.ReadAll(resp.Body)
-			if err != nil {
-				return err
-			}
-			bodyString := string(bodyBytes)
-			fmt.Printf("obsvs-ingestion/metrics response: %v\n", bodyString)
-		}
 
 		e.senderMu.Unlock()
 	}
