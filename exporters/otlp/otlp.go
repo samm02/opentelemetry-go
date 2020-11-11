@@ -22,9 +22,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/ioutil"
 	"net"
 	"net/http"
-	"strconv"
+	"os"
 	"sync"
 	"time"
 	"unsafe"
@@ -74,15 +75,12 @@ type ExporterHTTP struct {
 	senderMu sync.Mutex
 	started  bool
 
-	client  *ingestionServiceClient
-	headers map[string]string
+	ingestionClient *ingestionServiceClient
+	headers         map[string]string
+	ingestionURL    string
 	//signer  *asap.client
 
-	startOnce      sync.Once
-	stopCh         chan bool
-	disconnectedCh chan bool
-
-	backgroundConnectionDoneCh chan bool
+	startOnce sync.Once
 }
 
 type ingestionServiceClient struct {
@@ -117,8 +115,9 @@ func NewExporter(opts ...ExporterOption) (*Exporter, error) {
 }
 
 // NewExporter constructs a new Exporter and starts it.
-func NewExporterHTTP() (*ExporterHTTP, error) {
+func NewExporterHTTP(ingestionURL string) (*ExporterHTTP, error) {
 	exp := new(ExporterHTTP)
+	exp.ingestionURL = ingestionURL
 	if err := exp.Start(); err != nil {
 		return nil, err
 	}
@@ -183,12 +182,9 @@ func (e *ExporterHTTP) Start() error {
 
 		e.mu.Lock()
 		e.started = true
-		e.disconnectedCh = make(chan bool, 1)
-		e.stopCh = make(chan bool)
-		e.backgroundConnectionDoneCh = make(chan bool)
 		e.mu.Unlock()
 
-		e.client = &ingestionServiceClient{
+		e.ingestionClient = &ingestionServiceClient{
 			client: &http.Client{
 				Timeout: time.Second * 10,
 				Transport: &http.Transport{
@@ -199,8 +195,8 @@ func (e *ExporterHTTP) Start() error {
 				},
 			},
 			headers: map[string]string{
-				"service":      "anvil",
-				"environment":  "local",
+				"service":      os.Getenv("MICROS_SERVICE"),
+				"environment":  os.Getenv("MICROS_ENV"),
 				"Content-Type": "application/x-protobuf",
 			},
 		}
@@ -314,6 +310,27 @@ func (e *Exporter) Shutdown(ctx context.Context) error {
 	return err
 }
 
+// Shutdown closes all connections and releases resources currently being used
+// by the exporter. If the exporter is not started this does nothing.
+func (e *ExporterHTTP) Shutdown(ctx context.Context) error {
+	e.mu.RLock()
+	started := e.started
+	e.mu.RUnlock()
+
+	if !started {
+		return nil
+	}
+
+	e.mu.Lock()
+	e.started = false
+	e.mu.Unlock()
+
+	fmt.Printf("Shutting down exporter")
+	e.ingestionClient.client.CloseIdleConnections()
+
+	return nil
+}
+
 // Export implements the "go.opentelemetry.io/otel/sdk/export/metric".Exporter
 // interface. It transforms and batches metric Records into OTLP Metrics and
 // transmits them to the configured collector.
@@ -360,17 +377,9 @@ func (e *Exporter) Export(parent context.Context, cps metricsdk.CheckpointSet) e
 // interface. It transforms and batches metric Records into OTLP Metrics and
 // transmits them to the configured collector.
 func (e *ExporterHTTP) Export(parent context.Context, cps metricsdk.CheckpointSet) error {
-	// Unify the parent context Done signal with the exporter stopCh.
 
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
-	go func(ctx context.Context, cancel context.CancelFunc) {
-		select {
-		case <-ctx.Done():
-		case <-e.stopCh:
-			cancel()
-		}
-	}(ctx, cancel)
 
 	var workers uint = 1
 
@@ -379,50 +388,51 @@ func (e *ExporterHTTP) Export(parent context.Context, cps metricsdk.CheckpointSe
 		return err
 	}
 
-	select {
-	case <-e.stopCh:
-		return errStopped
-	case <-ctx.Done():
-		return errContextCanceled
-	default:
-		e.senderMu.Lock()
+	e.senderMu.Lock()
 
-		msr := &colmetricpb.ExportMetricsServiceRequest{
-			ResourceMetrics: rms,
-		}
-		fmt.Printf(strconv.Itoa(msr.Size()))
-		fmt.Printf(msr.String())
-		msrbytes, err := msr.Marshal()
-		if err != nil {
-			fmt.Errorf("error marshalling request: %w", err)
-			return err
-		}
-
-		//ctxmtd := e.contextWithMetadata(ctx)
-		//send those pieces of data as proto-bytes
-		//_, err := e.metricExporter.Export(ctxmtd, msr)
-
-		req, err := http.NewRequest(http.MethodPost, "https://obsvs-ingestion.ap-southeast-2.dev.atl-paas.net/v1/metrics", bytes.NewReader(msrbytes))
-		//req, err := http.NewRequest(http.MethodPost, "https://obsvs-ingestion.us-east-1.staging.atl-paas.net/v1/metrics", bytes.NewReader(msrbytes))
-		if err != nil {
-			fmt.Errorf("error creating request: %w", err)
-			return err
-		}
-
-		for k, v := range e.client.headers {
-			req.Header.Set(k, v)
-		}
-
-		resp, err := e.client.client.Do(req)
-		if err != nil {
-			fmt.Errorf("failed to send metrics to ingestion %w", err)
-			return err
-		}
-
-		fmt.Printf("obsvs-ingestion/metrics response: %v\n", resp.Status)
-
-		e.senderMu.Unlock()
+	msr := &colmetricpb.ExportMetricsServiceRequest{
+		ResourceMetrics: rms,
 	}
+
+	fmt.Printf(msr.String() + "\n")
+	msrbytes, err := msr.Marshal()
+	if err != nil {
+		fmt.Errorf("error marshalling request: %w", err)
+		return err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, e.ingestionURL, bytes.NewReader(msrbytes))
+
+	if err != nil {
+		fmt.Errorf("error creating request: %w", err)
+		return err
+	}
+
+	for k, v := range e.ingestionClient.headers {
+		req.Header.Set(k, v)
+	}
+
+	resp, err := e.ingestionClient.client.Do(req)
+	if err != nil {
+		fmt.Errorf("failed to send metrics to ingestion %w", err)
+		return err
+	}
+	defer resp.Body.Close()
+
+	switch resp.StatusCode / 100 {
+	case 2:
+		fmt.Printf("obsvs-ingestion/metrics response: %v\n", resp.Status)
+		// We have recieved a 2XX response nothing more for us to do
+	default:
+		body, err := ioutil.ReadAll(resp.Body)
+		if err != nil {
+			body = []byte("unable to process response")
+		}
+		return fmt.Errorf("received status code: %d, reason: %s", resp.StatusCode, string(body))
+	}
+
+	e.senderMu.Unlock()
+
 	return nil
 }
 
