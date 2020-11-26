@@ -179,7 +179,6 @@ func (e *Exporter) Start() error {
 func (e *ExporterHTTP) Start() error {
 	//var err = errAlreadyStarted
 	e.startOnce.Do(func() {
-		fmt.Printf("HTTP exporter started, setting MICROS_SERVICE: " + os.Getenv("MICROS_SERVICE") + " setting MICROS_ENV: " + os.Getenv("MICROS_ENV"))
 		e.mu.Lock()
 		e.started = true
 		e.mu.Unlock()
@@ -200,7 +199,6 @@ func (e *ExporterHTTP) Start() error {
 				"Content-Type": "application/x-protobuf",
 			},
 		}
-		fmt.Printf("HTTP exporter started returning\n")
 	})
 
 	return nil
@@ -314,7 +312,6 @@ func (e *Exporter) Shutdown(ctx context.Context) error {
 // Shutdown closes all connections and releases resources currently being used
 // by the exporter. If the exporter is not started this does nothing.
 func (e *ExporterHTTP) Shutdown(ctx context.Context) error {
-	fmt.Printf("Shutting down exporter start\n")
 	e.mu.RLock()
 	started := e.started
 	e.mu.RUnlock()
@@ -328,7 +325,6 @@ func (e *ExporterHTTP) Shutdown(ctx context.Context) error {
 	e.mu.Unlock()
 
 	e.ingestionClient.client.CloseIdleConnections()
-	fmt.Printf("Shutting down exporter finish\n")
 	return nil
 }
 
@@ -378,7 +374,6 @@ func (e *Exporter) Export(parent context.Context, cps metricsdk.CheckpointSet) e
 // interface. It transforms and batches metric Records into OTLP Metrics and
 // transmits them to the configured collector.
 func (e *ExporterHTTP) Export(parent context.Context, cps metricsdk.CheckpointSet) error {
-	fmt.Printf("HTTP exporter called\n")
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 
@@ -425,7 +420,6 @@ func (e *ExporterHTTP) Export(parent context.Context, cps metricsdk.CheckpointSe
 		fmt.Printf("obsvs-ingestion/metrics response: %v\n", resp.Status)
 		// We have recieved a 2XX response nothing more for us to do
 	default:
-		fmt.Printf("obsvs-ingestion/metrics response: %v\n", resp.Status)
 		body, err := ioutil.ReadAll(resp.Body)
 		if err != nil {
 			body = []byte("unable to process response")
@@ -434,7 +428,6 @@ func (e *ExporterHTTP) Export(parent context.Context, cps metricsdk.CheckpointSe
 	}
 
 	e.senderMu.Unlock()
-	fmt.Printf("HTTP exporter returning\n")
 	return nil
 }
 
